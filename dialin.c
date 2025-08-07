@@ -7,75 +7,156 @@
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <termios.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <inttypes.h>
 #include <sys/select.h>
 #include "dialtone.h"
 
+typedef enum {
+    IDLE = 0,
+    SENDING_DIALTONE,
+    CLIENT_DIALING,
+    CONNECTING,
+    CONNECTED
+} modem_state_t;
+
 typedef struct {
     int fd;
-    bool sendingDialTone;
     struct timeval lastDialtoneSend;
     int dialTonePos;
-    bool clientDialing;
-    struct timeval lastDigitRecieved;
+    modem_state_t state;
     pid_t pppd;
+    int rate;
     char path[512];
-} Modem;
+} modem_t;
+
+#define MAX_MODEMS 4
+static char pppdPath[256] = "/usr/sbin/pppd";
+static modem_t *modems[4];
+static int numModems = 0;
 
 bool send_string(int fd, char* str) {
     return write(fd, str, strlen(str)) == strlen(str);
 }
 
-void reset_modem(Modem *modem) {
+void reset_modem(modem_t *modem) {
     send_string(modem->fd, "ATZ0\r\n");
     usleep(1000000);
 	send_string(modem->fd, "ATE\r\n");
 	send_string(modem->fd, "ATV\r\n");
     tcflush(modem->fd, TCIFLUSH);
+    modem->state = IDLE;
 }
 
-int init_modem(Modem *modem, char *path) {
+int init_modem(modem_t *modem, char *path, unsigned int rate) {
     struct termios tty;
+    speed_t speed;
 
-    /* Open the TTY device */
-    if (modem == NULL) {
-        return -1;
-    }
-    modem->fd = open(path, O_RDWR | O_NOCTTY);
-    if (modem->fd < 0) {
-        return -2;
-    }
+    if (numModems < MAX_MODEMS) {
+        switch (rate) {
+            case 50:
+                speed = B50;
+                break;
+            case 75:
+                speed = B75;
+                break;
+            case 110:
+                speed = B110;
+                break;
+            case 134:
+                speed = B134;
+                break;
+            case 150:
+                speed = B150;
+                break;
+            case 200:
+                speed = B200;
+                break;
+            case 300:
+                speed = B300;
+                break;
+            case 600:
+                speed = B600;
+                break;
+            case 1200:
+                speed = B1200;
+                break;
+            case 1800:
+                speed = B1800;
+                break;
+            case 2400:
+                speed = B2400;
+                break;
+            case 4800:
+                speed = B4800;
+                break;
+            case 9600:
+                speed = B9600;
+                break;
+            case 19200:
+                speed = B19200;
+                break;
+            case 38400:
+                speed = B38400;
+                break;
+            case 57600:
+                speed = B57600;
+                break;
+            case 115200:
+                speed = B115200;
+                break;
+            case 230400:
+                speed = B230400;
+                break;
+            default:
+                return -1;
+        }
 
-    /* Get the TTY device's attributes. */
-    if (tcgetattr(modem->fd, &tty) != 0) {
-        return -3;
-    }
-    
-    /* Assuming defaults for reasonably modern modems. */
-    cfsetispeed(&tty, B115200);
-    cfsetospeed(&tty, B115200);
-    tty.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
-    tty.c_cflag |= CS8 | CREAD | CLOCAL;
-    tty.c_lflag = 0;
-    tty.c_oflag = 0;
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 10;
+        /* Open the TTY device */
+        if (modem == NULL) {
+            return -2;
+        }
+        modem->fd = open(path, O_RDWR | O_NOCTTY);
+        if (modem->fd < 0) {
+            return -3;
+        }
 
-    /* Apply configuration. */
-    if (tcsetattr(modem->fd, TCSANOW, &tty) != 0) {
-        return -4;
+        /* Get the TTY device's attributes. */
+        if (tcgetattr(modem->fd, &tty) != 0) {
+            return -4;
+        }
+
+        /* Assuming defaults for reasonably modern modems. */
+        cfsetispeed(&tty, speed);
+        cfsetospeed(&tty, speed);
+        tty.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
+        tty.c_cflag |= CS8 | CREAD | CLOCAL;
+        tty.c_lflag = 0;
+        tty.c_oflag = 0;
+        tty.c_cc[VMIN] = 0;
+        tty.c_cc[VTIME] = 10;
+
+        /* Apply configuration. */
+        if (tcsetattr(modem->fd, TCSANOW, &tty) != 0) {
+            return -4;
+        }
+        reset_modem(modem);
+        strncpy(modem->path, path, sizeof(modem->path));
+        modem->path[sizeof(modem->path) - 1] = 0;
+        modem->rate = rate;
+        modems[numModems] = modem;
+        numModems++;
+        return 0;
     }
-    reset_modem(modem);
-    strncpy(modem->path, path, sizeof(modem->path));
-    modem->path[sizeof(modem->path) - 1] = 0;
-    return 0;
+    return -5;
 }
 
 /* Get a response code from the modem. */
-int get_response(Modem *modem) {
+int get_response(modem_t *modem) {
     char buf[1024] = {0};
     int res;
     int bytes = read(modem->fd, buf, 1024);
@@ -96,14 +177,15 @@ int get_response(Modem *modem) {
     return res;
 }
 
-void send_escape(Modem *modem) {
+void send_escape(modem_t *modem) {
     send_string(modem->fd, "+++");
     usleep(1100000);
     assert(get_response(modem) == 0);
 }
 
-void send_dialtone(Modem *modem) {
-    if (modem->sendingDialTone) {
+void send_dialtone(modem_t *modem) {
+    /* Probably an unnecessary check. */
+    if (modem->state = SENDING_DIALTONE) {
         struct timeval now;
         gettimeofday(&now, NULL);
         int64_t usecSinceLastSend = (now.tv_sec - modem->lastDialtoneSend.tv_sec)*1000000 + (now.tv_usec - modem->lastDialtoneSend.tv_usec);
@@ -125,87 +207,102 @@ void send_dialtone(Modem *modem) {
     }
 }
 
-bool start_dialtone(Modem *modem) {
-    int res;
-    /*send_string(modem->fd, "ATH\r\n");
-    if ((res = get_response(modem)) != 0) {
-        printf("%d\n", res);
-        return false;
-    }*/
-	send_string(modem->fd, "AT+FCLASS=8\r\n");
-    if ((res = get_response(modem)) != 0) {
-        printf("%d\n", res);
-        return false;
+bool start_dialtone(modem_t *modem) {
+    if (modem->state == IDLE) {
+        int res;
+        /*send_string(modem->fd, "ATH\r\n");
+        if ((res = get_response(modem)) != 0) {
+            printf("%d\n", res);
+            return false;
+        }*/
+        send_string(modem->fd, "AT+FCLASS=8\r\n");
+        if ((res = get_response(modem)) != 0) {
+            printf("%d\n", res);
+            return false;
+        }
+        send_string(modem->fd, "AT+VLS=1\r\n");
+        if ((res = get_response(modem)) != 0) {
+            printf("%d\n", res);
+            return false;
+        }
+        send_string(modem->fd, "AT+VSM=1,8000\r\n");
+        if ((res = get_response(modem)) != 0) {
+            printf("%d\n", res);
+            return false;
+        }
+        send_string(modem->fd, "AT+VTX\r\n");
+        if (get_response(modem) != 1) {
+            return false;
+        }
+        modem->state = SENDING_DIALTONE;
+        modem->dialTonePos = 0;
+        gettimeofday(&modem->lastDialtoneSend, NULL);
+        modem->lastDialtoneSend.tv_sec -= 1;
+        send_dialtone(modem);
+        return true;
     }
-	send_string(modem->fd, "AT+VLS=1\r\n");
-    if ((res = get_response(modem)) != 0) {
-        printf("%d\n", res);
-        return false;
-    }
-	send_string(modem->fd, "AT+VSM=1,8000\r\n");
-    if ((res = get_response(modem)) != 0) {
-        printf("%d\n", res);
-        return false;
-    }
-	send_string(modem->fd, "AT+VTX\r\n");
-    if (get_response(modem) != 1) {
-        return false;
-    }
-    modem->sendingDialTone = true;
-    modem->clientDialing = false;
-    modem->dialTonePos = 0;
-    gettimeofday(&modem->lastDialtoneSend, NULL);
-    modem->lastDialtoneSend.tv_sec -= 1;
-    send_dialtone(modem);
-    return true;
+    return false;
 }
 
-void stop_dialtone(Modem *modem) {
-    char buf[] = {0x10, 0x03};
-    write(modem->fd, buf, sizeof(buf));
-    send_escape(modem);
-    send_string(modem->fd, "AT+FCLASS=0\r\n");
-    assert(get_response(modem) == 0);
-    modem->sendingDialTone = false;
+void stop_dialtone(modem_t *modem) {
+    if (modem->state == SENDING_DIALTONE) {
+        char buf[] = {0x10, 0x03};
+        modem->state = IDLE;
+        write(modem->fd, buf, sizeof(buf));
+        send_escape(modem);
+        send_string(modem->fd, "AT+FCLASS=0\r\n");
+        assert(get_response(modem) == 0);
+    }
 }
 
-bool answer_call(Modem *modem) {
+bool answer_call(modem_t *modem) {
     struct timeval timeout = {60, 0};
     fd_set modemSet;
+    int res;
 	/* Don't know if this is needed and takes forever to execute on my G4 modem. */
 	/* send_string(modem->fd, "ATH1\r\n");
     assert(get_response(modem) == 0); */
+    tcflush(modem->fd, TCIFLUSH);
     send_string(modem->fd, "ATM1\r\n");
     assert(get_response(modem) == 0);
     send_string(modem->fd, "ATA\r\n");
-    /* Give a second for the modem to respond (for modems that send OK after ATA). */
-    usleep(1000000);
-    tcflush(modem->fd, TCIFLUSH);
+    res = get_response(modem);
+    /* If we get some kind of error answering the call, return. */
+    if (res != 0 && res != -1) {
+        return false;
+    }
+    /* Handle modems with respond with OK after ATA */
     /* Wait 60s for the modem to respond. */
     FD_ZERO(&modemSet);
     FD_SET(modem->fd, &modemSet);
     if (select(modem->fd + 1, &modemSet, NULL, NULL, &timeout) == 1 && FD_ISSET(modem->fd, &modemSet)) {
-        int res;
+        int res = get_response(modem);
         /* Don't know rn what reponse codes modems will return. */
-        if ((res = get_response(modem)) == 4) {
-            printf("%d\n", res);
+        if (res == 3 || res == 4) {
+            puts("Modem failed to connect!\n");
+            modem->state = IDLE;
             return false;
         }
+        printf("Modem returned code %d.\n", res);
         /* Start PPPD. */
 		usleep(100000);
         pid_t id = fork();
         if (id == 0) {
-            assert(execl("/usr/sbin/pppd", "-detach", modem->path, "115200", "file", "options.modem", NULL) != -1);
+            char buf[16];
+            sprintf(buf, "%d", modem->rate);
+            assert(execl(pppdPath, "-detach", modem->path, buf, "file", "options.modem", NULL) != -1);
         } else {
             modem->pppd = id;
+            modem->state = CONNECTED;
         }
         return true;
     }
     /* If the modem doesn't respond after 60s, something's wrong. */
+    modem->state = IDLE;
     return false;
 }
 
-void modem_loop(Modem *modem) {
+void modem_loop(modem_t *modem) {
 	while (true) {
 		if (!start_dialtone(modem)) {
 			break;
@@ -224,39 +321,78 @@ void modem_loop(Modem *modem) {
                 int bytes = read(modem->fd, buf, 2);
                 /* The client is dialing a number. */
                 if (bytes > 1 && buf[0] == 0x10 && isdigit(buf[1])) {
-                    modem->clientDialing = true;
-                    gettimeofday(&modem->lastDigitRecieved, NULL);
-                }
-            } else if (modem->clientDialing) {
-                struct timeval now;
-                gettimeofday(&now, NULL);
-                if ((now.tv_sec - modem->lastDigitRecieved.tv_sec)*1000 + (now.tv_usec - modem->lastDigitRecieved.tv_usec)/1000 > 500) {
-                    /* The client is done dialing*/
-                    modem->clientDialing = false;
                     break;
                 }
             }
         }
         stop_dialtone(modem);
-		puts("Client dialed! Picking up...\n");
+        puts("Client dialed! Picking up...\n");
+        /* Wait 5 secs for the client to finish dialing. */
+        usleep(5000000);
         if (answer_call(modem)) {
 			int res;
 			puts("Client connected!\n");
 			waitpid(modem->pppd, &res, 0);
+            printf("PPPd exited. Code: %d\n", res);
+            reset_modem(modem);
 		} else {
 			puts("Client failed to connect. :(\n");
 		}
 	}
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        return -1;
-    }
-    /* Init the modem */
-    Modem modem = {0};
+void sig_handler(int sig) {
+    /* Stop PPPd */
     int res;
-    if ((res = init_modem(&modem, argv[1])) != 0) {
+    for (int i = 0; i < numModems; i++) {
+        if (modems[i]->state == CONNECTED) {
+            kill(modems[i]->pppd, SIGINT);
+        }
+    }
+    waitpid(-1, &res, 0);
+    if (sig == SIGINT) {
+        for (int i = 0; i < numModems; i++) {
+            close(modems[i]->fd);
+        }
+        exit(0);
+    }
+}
+
+int main(int argc, char **argv) {
+    char* tty;
+    int rate = 115200;
+    int opt;
+    while ((opt = getopt(argc, argv, "b:p:")) != -1) {
+        switch (opt) {
+            case 'b':
+                if (sscanf(optarg, "%u", &rate) != 1) {
+                    fputs("Invalid baud rate specified.\n", stderr);
+                }
+                break;
+            case 'p':
+                strncpy(pppdPath, optarg, 256);
+                pppdPath[255] = 0;
+                break;
+            case '?':
+                if (optopt == 'b') {
+                    fputs("Usage: -b <baud rate> (in kbits/s not baud)\n", stderr);
+                } else if (optopt == 'p') {
+                    fputs("Usage: -p <path to pppd>\n", stderr);
+                } else if (isprint(optopt)) {
+                    fprintf(stderr, "Option -%c unknown\n", optopt);
+                } else {
+                    fputs("idk what happened. check your command line.\n", stderr);
+                }
+                return 1;
+        }
+    }
+    /* Initialize signal handlers. */
+    signal(SIGINT, sig_handler);
+    signal(SIGHUP, sig_handler);
+    /* Init the modem */
+    modem_t modem = {0};
+    int res;
+    if ((res = init_modem(&modem, argv[1], rate)) != 0) {
         printf("Initializing modem %s failed! Return val: %i; Error: %s\n", argv[1], res, strerror(errno));
         return res;
     }
