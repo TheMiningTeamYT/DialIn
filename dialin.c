@@ -279,7 +279,7 @@ bool answer_call(modem_t *modem) {
         int res = get_response(modem);
         /* Don't know rn what reponse codes modems will return. */
         if (res == 3 || res == 4) {
-            puts("Modem failed to connect!\n");
+            puts("Modem failed to connect!");
             modem->state = IDLE;
             return false;
         }
@@ -307,7 +307,7 @@ void modem_loop(modem_t *modem) {
 		if (!start_dialtone(modem)) {
 			break;
 		}
-		puts("Listening for dial...\n");
+		puts("Listening for dial...");
 		while (true) {
             fd_set modemSet;
             struct timeval timeout = {0, 50000};
@@ -326,17 +326,17 @@ void modem_loop(modem_t *modem) {
             }
         }
         stop_dialtone(modem);
-        puts("Client dialed! Picking up...\n");
+        puts("Client dialed! Picking up...");
         /* Wait 5 secs for the client to finish dialing. */
         usleep(5000000);
         if (answer_call(modem)) {
 			int res;
-			puts("Client connected!\n");
+			puts("Client connected!");
 			waitpid(modem->pppd, &res, 0);
             printf("PPPd exited. Code: %d\n", res);
             reset_modem(modem);
 		} else {
-			puts("Client failed to connect. :(\n");
+			puts("Client failed to connect. :(");
 		}
 	}
 }
@@ -362,7 +362,11 @@ int main(int argc, char **argv) {
     char* tty;
     int rate = 115200;
     int opt;
-    while ((opt = getopt(argc, argv, "b:p:")) != -1) {
+    if (argc < 2) {
+        puts("You must specify a modem TTY to use! Run with -h for help.");
+        return -1;
+    }
+    while ((opt = getopt(argc, argv, "b:p:h")) != -1) {
         switch (opt) {
             case 'b':
                 if (sscanf(optarg, "%u", &rate) != 1) {
@@ -373,15 +377,29 @@ int main(int argc, char **argv) {
                 strncpy(pppdPath, optarg, 256);
                 pppdPath[255] = 0;
                 break;
+            case 'h':
+                printf(
+                    "DialIn v0.1a\n\n"
+                    "Usage:\n"
+                    "%s <modem TTY> [optional args...]\n\n"
+                    "Optional args:\n"
+                    "-b <baud rate> : The TTY speed to use (in bits/s). [Default: 115200 bits/s]\n"
+                    "-p <path to pppd> : The path to the pppd executable to use. [Default: \"/usr/sbin/pppd\"]\n"
+                    "-h : Display this help.\n\n"
+                    "Copyright (C) 2025 Logan C. GPLv3.\n"
+                    "Have fun!\n"
+                    "-Loganius. :)\n\n",
+                    argv[0]);
+                return 0;
             case '?':
                 if (optopt == 'b') {
-                    fputs("Usage: -b <baud rate> (in kbits/s not baud)\n", stderr);
+                    fputs("Usage: -b <baud rate> (in bits/s not baud)", stderr);
                 } else if (optopt == 'p') {
-                    fputs("Usage: -p <path to pppd>\n", stderr);
+                    fputs("Usage: -p <path to pppd>", stderr);
                 } else if (isprint(optopt)) {
-                    fprintf(stderr, "Option -%c unknown\n", optopt);
+                    fprintf(stderr, "Option -%c unknown", optopt);
                 } else {
-                    fputs("idk what happened. check your command line.\n", stderr);
+                    fputs("idk what happened. check your command line.", stderr);
                 }
                 return 1;
         }
@@ -398,7 +416,7 @@ int main(int argc, char **argv) {
     }
 
     /* Test answering a call. */
-	puts("Answering client.\n");
+	puts("Answering client.");
     answer_call(&modem);
 	waitpid(modem.pppd, &res, 0);
 
