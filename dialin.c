@@ -48,6 +48,7 @@ void reset_modem(modem_t *modem) {
     usleep(1000000);
 	send_string(modem->fd, "ATE\r\n");
 	send_string(modem->fd, "ATV\r\n");
+    send_string(modem->fd, "ATH0\r\n");
     tcflush(modem->fd, TCIFLUSH);
     modem->state = IDLE;
 }
@@ -407,6 +408,7 @@ int main(int argc, char **argv) {
     /* Initialize signal handlers. */
     signal(SIGINT, sig_handler);
     signal(SIGHUP, sig_handler);
+
     /* Init the modem */
     modem_t modem = {0};
     int res;
@@ -415,10 +417,9 @@ int main(int argc, char **argv) {
         return res;
     }
 
-    /* Test answering a call. */
-	puts("Answering client.");
-    answer_call(&modem);
-	waitpid(modem.pppd, &res, 0);
+    /* Start the modem loop */
+    modem_loop(&modem);
+    puts("Something went wrong. The modem loop ended.\n");
 
     /* Clean up. */
     close(modem.fd);
