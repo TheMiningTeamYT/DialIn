@@ -293,7 +293,7 @@ bool answer_call(modem_t *modem) {
         if (id == 0) {
             char buf[16];
             sprintf(buf, "%d", modem->rate);
-            assert(execl(pppdPath, "-detach", modem->path, buf, "file", "options.modem", NULL) != -1);
+            assert(execl(pppdPath, modem->path, buf, "nodetach", "file", "options.modem", NULL) != -1);
         } else {
             modem->pppd = id;
             modem->state = CONNECTED;
@@ -331,7 +331,7 @@ void modem_loop(modem_t *modem) {
         /* Wait 5 secs for the client to finish dialing. */
         usleep(5000000);
         if (answer_call(modem)) {
-			int res;
+            int res;
 			puts("Client connected!");
 			waitpid(modem->pppd, &res, 0);
             printf("PPPd exited. Code: %d\n", res);
@@ -344,13 +344,12 @@ void modem_loop(modem_t *modem) {
 
 void sig_handler(int sig) {
     /* Stop PPPd */
-    int res;
     for (int i = 0; i < numModems; i++) {
         if (modems[i]->state == CONNECTED) {
             kill(modems[i]->pppd, SIGINT);
         }
     }
-    waitpid(-1, &res, 0);
+    waitpid(-1, NULL, 0);
     if (sig == SIGINT) {
         for (int i = 0; i < numModems; i++) {
             close(modems[i]->fd);
@@ -360,15 +359,11 @@ void sig_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-    char* tty;
+    char* tty = NULL;
     int rate = 115200;
     bool nodial = false;
     int opt;
-    if (argc < 2) {
-        puts("You must specify a modem TTY to use! Run with -h for help.");
-        return -1;
-    }
-    while ((opt = getopt(argc, argv, "b:p:nh")) != -1) {
+    while ((opt = getopt(argc, argv, "b:p:m:nh")) != -1) {
         switch (opt) {
             case 'b':
                 if (sscanf(optarg, "%u", &rate) != 1) {
@@ -382,11 +377,14 @@ int main(int argc, char **argv) {
             case 'n':
                 nodial = true;
                 break;
+            case 'm':
+                tty = optarg;
+                break;
             case 'h':
                 printf(
                     "DialIn v0.1a\n\n"
                     "Usage:\n"
-                    "%s <modem TTY> [optional args...]\n\n"
+                    "%s -m <modem TTY> [optional args...]\n\n"
                     "Optional args:\n"
                     "-b <baud rate> : The TTY speed to use (in bits/s). [Default: 115200 bits/s]\n"
                     "-p <path to pppd> : The path to the pppd executable to use. [Default: \"/usr/sbin/pppd\"]\n"
@@ -402,6 +400,8 @@ int main(int argc, char **argv) {
                     fputs("Usage: -b <baud rate> (in bits/s not baud)", stderr);
                 } else if (optopt == 'p') {
                     fputs("Usage: -p <path to pppd>", stderr);
+                } else if (optopt == 'm') {
+                    fputs("Usage: -m <modem TTY> : The full path to the modem's TTY. Example: /dev/ttyS0", stderr);
                 } else if (isprint(optopt)) {
                     fprintf(stderr, "Option -%c unknown", optopt);
                 } else {
@@ -410,22 +410,29 @@ int main(int argc, char **argv) {
                 return 1;
         }
     }
+
+    if (tty == NULL) {
+        puts("You must specify a modem TTY to use! Run with -h for help.");
+        return -1;
+    }
+
     /* Initialize signal handlers. */
-    signal(SIGINT, sig_handler);
-    signal(SIGHUP, sig_handler);
+    /* signal(SIGINT, sig_handler);
+    signal(SIGHUP, sig_handler); */
 
     /* Init the modem */
     modem_t modem = {0};
     int res;
-    if ((res = init_modem(&modem, argv[1], rate)) != 0) {
-        printf("Initializing modem %s failed! Return val: %i; Error: %s\n", argv[1], res, strerror(errno));
+    if ((res = init_modem(&modem, tty, rate)) != 0) {
+        printf("Initializing modem %s failed! Return val: %i; Error: %s\n", tty, res, strerror(errno));
         return res;
     }
 
     /* Start the modem loop */
     if (nodial) {
         if (answer_call(&modem)) {
-            waitpid(modem.pppd, &res, 0);
+            printf("Client connected! :D PPPD PID: %d\n", modem.pppd);
+            waitpid(modem.pppd, NULL, 0);
         } else {
             puts("Client failed to connect. :(");
         }
