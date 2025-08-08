@@ -34,9 +34,9 @@ typedef struct {
     char path[512];
 } modem_t;
 
-#define MAX_MODEMS 4
+#define MAX_MODEMS 1
 static char pppdPath[256] = "/usr/sbin/pppd";
-static modem_t *modems[4];
+static modem_t *modems[MAX_MODEMS];
 static int numModems = 0;
 
 bool send_string(int fd, char* str) {
@@ -262,42 +262,45 @@ void stop_dialtone(modem_t *modem) {
 }
 
 bool answer_call(modem_t *modem) {
-    struct timeval timeout = {60, 0};
-    int res;
-	/* Don't know if this is needed and takes forever to execute on my G4 modem. */
-	send_string(modem->fd, "ATH1\r\n");
-    assert(get_response(modem, 10) == 0);
-    tcflush(modem->fd, TCIFLUSH);
-    send_string(modem->fd, "ATM1\r\n");
-    assert(get_response(modem, 1) == 0);
-    send_string(modem->fd, "ATA\r\n");
-    res = get_response(modem, 1);
-    /* If we get some kind of error answering the call, return. */
-    if (res != 0 && res != -1) {
-        return false;
+    if (modem->state == IDLE) {
+        struct timeval timeout = {60, 0};
+        int res;
+        /* Don't know if this is needed and takes forever to execute on my G4 modem. */
+        send_string(modem->fd, "ATH1\r\n");
+        assert(get_response(modem, 10) == 0);
+        tcflush(modem->fd, TCIFLUSH);
+        send_string(modem->fd, "ATM1\r\n");
+        assert(get_response(modem, 1) == 0);
+        send_string(modem->fd, "ATA\r\n");
+        res = get_response(modem, 1);
+        /* If we get some kind of error answering the call, return. */
+        if (res != 0 && res != -1) {
+            return false;
+        }
+        /* Handle modems with respond with OK after ATA */
+        /* Wait 60s for the modem to respond. */
+        res = get_response(modem, 60);
+        /* Don't know rn what reponse codes modems will return. */
+        if (res == 3 || res == 4 || res == -1) {
+            puts("Modem failed to connect!");
+            modem->state = IDLE;
+            return false;
+        }
+        printf("Modem returned code %d.\n", res);
+        /* Start PPPD. */
+        usleep(100000);
+        pid_t id = fork();
+        if (id == 0) {
+            char buf[16];
+            sprintf(buf, "%d", modem->rate);
+            assert(execl(pppdPath, "-detach", modem->path, buf, "file", "options.modem", NULL) != -1);
+        } else {
+            modem->pppd = id;
+            modem->state = CONNECTED;
+        }
+        return true;
     }
-    /* Handle modems with respond with OK after ATA */
-    /* Wait 60s for the modem to respond. */
-    res = get_response(modem, 60);
-    /* Don't know rn what reponse codes modems will return. */
-    if (res == 3 || res == 4 || res == -1) {
-        puts("Modem failed to connect!");
-        modem->state = IDLE;
-        return false;
-    }
-    printf("Modem returned code %d.\n", res);
-    /* Start PPPD. */
-    usleep(100000);
-    pid_t id = fork();
-    if (id == 0) {
-        char buf[16];
-        sprintf(buf, "%d", modem->rate);
-        assert(execl(pppdPath, "-detach", modem->path, buf, "file", "options.modem", NULL) != -1);
-    } else {
-        modem->pppd = id;
-        modem->state = CONNECTED;
-    }
-    return true;
+    return false;
 }
 
 void modem_loop(modem_t *modem) {
@@ -359,12 +362,13 @@ void sig_handler(int sig) {
 int main(int argc, char **argv) {
     char* tty;
     int rate = 115200;
+    bool nodial = false;
     int opt;
     if (argc < 2) {
         puts("You must specify a modem TTY to use! Run with -h for help.");
         return -1;
     }
-    while ((opt = getopt(argc, argv, "b:p:h")) != -1) {
+    while ((opt = getopt(argc, argv, "b:p:nh")) != -1) {
         switch (opt) {
             case 'b':
                 if (sscanf(optarg, "%u", &rate) != 1) {
@@ -375,6 +379,9 @@ int main(int argc, char **argv) {
                 strncpy(pppdPath, optarg, 256);
                 pppdPath[255] = 0;
                 break;
+            case 'n':
+                nodial = true;
+                break;
             case 'h':
                 printf(
                     "DialIn v0.1a\n\n"
@@ -383,6 +390,7 @@ int main(int argc, char **argv) {
                     "Optional args:\n"
                     "-b <baud rate> : The TTY speed to use (in bits/s). [Default: 115200 bits/s]\n"
                     "-p <path to pppd> : The path to the pppd executable to use. [Default: \"/usr/sbin/pppd\"]\n"
+                    "-n : No dial. Don't wait for the client to dial: immediately tell the modem to answer.\n"
                     "-h : Display this help.\n\n"
                     "Copyright (C) 2025 Logan C. GPLv3.\n"
                     "Have fun!\n"
@@ -415,8 +423,16 @@ int main(int argc, char **argv) {
     }
 
     /* Start the modem loop */
-    modem_loop(&modem);
-    puts("Something went wrong. The modem loop ended.\n");
+    if (nodial) {
+        if (answer_call(&modem)) {
+            waitpid(modem.pppd, &res, 0);
+        } else {
+            puts("Client failed to connect. :(");
+        }
+    } else {
+        modem_loop(&modem);
+        puts("Something went wrong. The modem loop ended.");
+    }
 
     /* Clean up. */
     close(modem.fd);
