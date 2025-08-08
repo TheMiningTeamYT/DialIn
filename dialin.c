@@ -48,7 +48,6 @@ void reset_modem(modem_t *modem) {
     usleep(1000000);
 	send_string(modem->fd, "ATE\r\n");
 	send_string(modem->fd, "ATV\r\n");
-    send_string(modem->fd, "ATH0\r\n");
     tcflush(modem->fd, TCIFLUSH);
     modem->state = IDLE;
 }
@@ -157,10 +156,16 @@ int init_modem(modem_t *modem, char *path, unsigned int rate) {
 }
 
 /* Get a response code from the modem. */
-int get_response(modem_t *modem) {
+int get_response(modem_t *modem, unsigned int attempts) {
     char buf[1024] = {0};
     int res;
-    int bytes = read(modem->fd, buf, 1024);
+    int bytes;
+    /* 0 attempts to read doesn't make sense. */
+    if (attempts == 0) {
+        attempts = 1;
+    }
+
+    for (int i = 0; (i < attempts) && ((bytes = read(modem->fd, buf, 1024)) <= 0); i++) {};
 
     if (bytes <= 0) {
         return -1;
@@ -172,7 +177,7 @@ int get_response(modem_t *modem) {
         buf[1023] = 0;
     }
 
-    if (sscanf(buf, "%d", &res) != 1) {
+    if (sscanf(buf, "%u", &res) != 1) {
         return -1;
     }
     return res;
@@ -181,7 +186,7 @@ int get_response(modem_t *modem) {
 void send_escape(modem_t *modem) {
     send_string(modem->fd, "+++");
     usleep(1100000);
-    assert(get_response(modem) == 0);
+    assert(get_response(modem, 1) == 0);
 }
 
 void send_dialtone(modem_t *modem) {
@@ -211,28 +216,28 @@ void send_dialtone(modem_t *modem) {
 bool start_dialtone(modem_t *modem) {
     if (modem->state == IDLE) {
         int res;
-        /*send_string(modem->fd, "ATH\r\n");
-        if ((res = get_response(modem)) != 0) {
+        send_string(modem->fd, "ATH\r\n");
+        if ((res = get_response(modem, 5)) != 0) {
             printf("%d\n", res);
             return false;
-        }*/
+        }
         send_string(modem->fd, "AT+FCLASS=8\r\n");
-        if ((res = get_response(modem)) != 0) {
+        if ((res = get_response(modem, 1)) != 0) {
             printf("%d\n", res);
             return false;
         }
         send_string(modem->fd, "AT+VLS=1\r\n");
-        if ((res = get_response(modem)) != 0) {
+        if ((res = get_response(modem, 1)) != 0) {
             printf("%d\n", res);
             return false;
         }
         send_string(modem->fd, "AT+VSM=1,8000\r\n");
-        if ((res = get_response(modem)) != 0) {
+        if ((res = get_response(modem, 1)) != 0) {
             printf("%d\n", res);
             return false;
         }
         send_string(modem->fd, "AT+VTX\r\n");
-        if (get_response(modem) != 1) {
+        if (get_response(modem, 1) != 1) {
             return false;
         }
         modem->state = SENDING_DIALTONE;
@@ -252,55 +257,47 @@ void stop_dialtone(modem_t *modem) {
         write(modem->fd, buf, sizeof(buf));
         send_escape(modem);
         send_string(modem->fd, "AT+FCLASS=0\r\n");
-        assert(get_response(modem) == 0);
+        assert(get_response(modem, 1) == 0);
     }
 }
 
 bool answer_call(modem_t *modem) {
     struct timeval timeout = {60, 0};
-    fd_set modemSet;
     int res;
 	/* Don't know if this is needed and takes forever to execute on my G4 modem. */
-	/* send_string(modem->fd, "ATH1\r\n");
-    assert(get_response(modem) == 0); */
+	send_string(modem->fd, "ATH1\r\n");
+    assert(get_response(modem, 10) == 0);
     tcflush(modem->fd, TCIFLUSH);
     send_string(modem->fd, "ATM1\r\n");
-    assert(get_response(modem) == 0);
+    assert(get_response(modem, 1) == 0);
     send_string(modem->fd, "ATA\r\n");
-    res = get_response(modem);
+    res = get_response(modem, 1);
     /* If we get some kind of error answering the call, return. */
     if (res != 0 && res != -1) {
         return false;
     }
     /* Handle modems with respond with OK after ATA */
     /* Wait 60s for the modem to respond. */
-    FD_ZERO(&modemSet);
-    FD_SET(modem->fd, &modemSet);
-    if (select(modem->fd + 1, &modemSet, NULL, NULL, &timeout) == 1 && FD_ISSET(modem->fd, &modemSet)) {
-        int res = get_response(modem);
-        /* Don't know rn what reponse codes modems will return. */
-        if (res == 3 || res == 4) {
-            puts("Modem failed to connect!");
-            modem->state = IDLE;
-            return false;
-        }
-        printf("Modem returned code %d.\n", res);
-        /* Start PPPD. */
-		usleep(100000);
-        pid_t id = fork();
-        if (id == 0) {
-            char buf[16];
-            sprintf(buf, "%d", modem->rate);
-            assert(execl(pppdPath, "-detach", modem->path, buf, "file", "options.modem", NULL) != -1);
-        } else {
-            modem->pppd = id;
-            modem->state = CONNECTED;
-        }
-        return true;
+    res = get_response(modem, 60);
+    /* Don't know rn what reponse codes modems will return. */
+    if (res == 3 || res == 4 || res == -1) {
+        puts("Modem failed to connect!");
+        modem->state = IDLE;
+        return false;
     }
-    /* If the modem doesn't respond after 60s, something's wrong. */
-    modem->state = IDLE;
-    return false;
+    printf("Modem returned code %d.\n", res);
+    /* Start PPPD. */
+    usleep(100000);
+    pid_t id = fork();
+    if (id == 0) {
+        char buf[16];
+        sprintf(buf, "%d", modem->rate);
+        assert(execl(pppdPath, "-detach", modem->path, buf, "file", "options.modem", NULL) != -1);
+    } else {
+        modem->pppd = id;
+        modem->state = CONNECTED;
+    }
+    return true;
 }
 
 void modem_loop(modem_t *modem) {
